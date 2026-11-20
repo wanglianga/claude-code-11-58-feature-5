@@ -1,4 +1,4 @@
-"""种子数据:五类验收场景。
+"""种子数据:五类验收场景 + 设备健康六类验收场景。
 
 RUN-1001 跨区段折返(T01, L1, S1->S2 上行折返后下行返回)
 RUN-1002 设备重启 + 倍率区间切换 + 运行中换编组(T02, L1)
@@ -6,18 +6,29 @@ RUN-1003 回馈受限(T03, L2/S3,变电所不接受回馈上网)
 RUN-1004 车载与供电表差异(T01, L1,差异=线损+未明残差)
 RUN-1005 补传读数(T02, L1,先按缺测发布 v1,迟到数据触发 v2)
 RUN-1006 供电表缺失(T03, L2,供电侧输出未知范围,不以车载冒充闭合)
+
+设备健康(RUN-2xxx 历史运行 + 健康档案):
+季节负荷变化  T01 八月高温运行绝对能耗高,但落在高温条件层基线内 -> 不报警
+部件更换      T02 牵引电机 10-10 更换 -> 新安装周期趋势重新起算
+慢性劣化      T01 牵引电机 11 月起残差持续超限 -> 慢性劣化报警
+突发故障      T03 10-22 单点剧增 -> 突发报警(当日故障记录确认)
+校准失效      OB-T02 校准过期/失效、OB-T03 校准过期 -> 报警资格降低/取消,不默认正常
+维修记录迟到  T01 故障 11-15 发生、11-25 才登记 -> 健康期重标,旧报警保留当时依据
 """
 from __future__ import annotations
 
+import zlib
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal
-from .models import (ConfigVersion, Consist, Device, Line, MeterReading, Run,
-                     RunConsist, RunEvent, Section, Train, User, create_all,
-                     drop_all)
+from .models import (ComponentInstall, ConfigVersion, Consist, Device,
+                     HealthWatchConfig, Line, MaintenanceEvent, MeterReading,
+                     Run, RunCondition, RunConsist, RunEvent, Section,
+                     SensorCalibration, Train, User, create_all, drop_all)
 from .services.evaluate import evaluate_run, rebuild_grid
+from .services.health import record_maintenance, run_trend_batch
 from .services.metrics import publish_run_metrics, reprocess_run
 from .services.reconcile import reconcile_grid_aligned, reconcile_run_aligned
 
@@ -106,6 +117,196 @@ def process(db, run, note=None):
     reconcile_run_aligned(db, run)
     reconcile_grid_aligned(db, run)
     publish_run_metrics(db, run, note=note)
+
+
+# ---------------- 设备健康场景 ----------------
+
+HEALTH_BASE_PER_KM = {"M1": 0.82, "M2": 1.40}  # 各车型健康状态单位净能耗(kWh/km)
+
+
+def _jitter(run_key: str) -> float:
+    """确定性 ±1% 抖动(同一 run_key 跨次重建结果一致)。"""
+    return 1.0 + ((zlib.crc32(run_key.encode()) % 7) - 3) / 300.0
+
+
+def gen_health_run(db: Session, st: dict, run_key: str, train: Train,
+                   line: Line, section: Section, sub: Device, consist: Consist,
+                   ob: Device, start: datetime, temp: float, pax: int,
+                   factor: float, restriction: bool = False,
+                   with_condition: bool = True, shift: str = "平峰-健康"):
+    """生成一趟 20 分钟单区段运行:单位净能耗 = 车型基值 × factor × 抖动。
+
+    factor 已含温度/载客/限速/劣化等全部放大因素;车载读数按
+    牵引:回馈:辅助 = 1.30 : 0.42 : 0.12 拆分(净 = 牵引 + 辅助 - 回馈)。
+    """
+    dur = timedelta(minutes=20)
+    dist = section.length_km
+    net = HEALTH_BASE_PER_KM[train.vehicle_model] * factor * _jitter(run_key) * dist
+    traction_t, regen_t, aux_t = net * 1.30, net * 0.42, net * 0.12
+    run = mk_run(db, run_key, train, line, start, start + dur, dist, pax, shift)
+    db.add(RunConsist(run_id=run.id, consist_id=consist.id, valid_from=start))
+    ev(db, run, start, "ENTER_SECTION", section, "UP")
+    ev(db, run, start + dur, "EXIT_SECTION", section, "UP")
+    gen_onboard(db, ob, st[ob.serial], start, start + dur,
+                rates=(traction_t / 20, regen_t / 20, aux_t / 20))
+    gen_supply(db, sub, st[sub.serial], start, start + dur + timedelta(minutes=5),
+               imp_rate=net * 1.06 / 20, exp_rate=regen_t * 0.9 / 20)
+    if with_condition:
+        db.add(RunCondition(run_id=run.id, ambient_temp_c=temp, weather="CLEAR",
+                            speed_restriction=1 if restriction else 0))
+    process(db, run)
+    return run
+
+
+def seed_health(db: Session, st: dict, t01, t02, t03, l1, l2, s1, s3,
+                sub1, sub3, c01, c02a, c02b, c03, ob1, ob2, ob3):
+    """健康档案 + 六类验收场景的历史运行,最后执行两批趋势运行。"""
+    t0 = datetime(2026, 1, 1)
+    # ---- 允许关注的设备层级 ----
+    db.add_all([
+        HealthWatchConfig(level="COMPONENT", component_type="TRACTION_MOTOR",
+                          enabled=1, params={},
+                          note="牵引电机:启用部件级条件化残差趋势"),
+        HealthWatchConfig(level="TRAIN", component_type=None, enabled=0,
+                          params={},
+                          note="整车级未启用:车队规模小,部件级已覆盖"),
+    ])
+    # ---- 部件安装/更换区间 ----
+    i_t01 = ComponentInstall(train_id=t01.id, component_type="TRACTION_MOTOR",
+                             serial="TM-T01-A", installed_at=t0, note="在役")
+    i_t02a = ComponentInstall(train_id=t02.id, component_type="TRACTION_MOTOR",
+                              serial="TM-T02-A", installed_at=t0,
+                              removed_at=datetime(2026, 10, 10, 9),
+                              note="到达寿命,更换退役")
+    i_t02b = ComponentInstall(train_id=t02.id, component_type="TRACTION_MOTOR",
+                              serial="TM-T02-B",
+                              installed_at=datetime(2026, 10, 10, 9), note="在役")
+    i_t03a = ComponentInstall(train_id=t03.id, component_type="TRACTION_MOTOR",
+                              serial="TM-T03-A", installed_at=t0,
+                              removed_at=datetime(2026, 10, 23, 14),
+                              note="接地故障后更换退役")
+    i_t03b = ComponentInstall(train_id=t03.id, component_type="TRACTION_MOTOR",
+                              serial="TM-T03-B",
+                              installed_at=datetime(2026, 10, 23, 14), note="在役")
+    db.add_all([i_t01, i_t02a, i_t02b, i_t03a, i_t03b])
+    db.flush()
+    # ---- 传感器校准状态 ----
+    db.add_all([
+        SensorCalibration(device_id=ob1.id, status="VALID", valid_from=t0),
+        SensorCalibration(device_id=ob2.id, status="VALID", valid_from=t0,
+                          valid_to=datetime(2026, 10, 8)),
+        SensorCalibration(device_id=ob2.id, status="EXPIRED",
+                          valid_from=datetime(2026, 10, 8),
+                          valid_to=datetime(2026, 10, 20), note="校准到期未检"),
+        SensorCalibration(device_id=ob2.id, status="VALID",
+                          valid_from=datetime(2026, 10, 20),
+                          valid_to=datetime(2026, 11, 1), note="临时校验合格"),
+        SensorCalibration(device_id=ob2.id, status="FAILED",
+                          valid_from=datetime(2026, 11, 1),
+                          valid_to=datetime(2026, 11, 6),
+                          note="校验发现超差,期间读数不可信"),
+        SensorCalibration(device_id=ob2.id, status="VALID",
+                          valid_from=datetime(2026, 11, 6), note="重新校准合格"),
+        SensorCalibration(device_id=ob3.id, status="VALID", valid_from=t0,
+                          valid_to=datetime(2026, 10, 28)),
+        SensorCalibration(device_id=ob3.id, status="EXPIRED",
+                          valid_from=datetime(2026, 10, 28),
+                          valid_to=datetime(2026, 11, 14),
+                          note="校准过期,读数存疑"),
+        SensorCalibration(device_id=ob3.id, status="VALID",
+                          valid_from=datetime(2026, 11, 14)),
+    ])
+    # ---- 准时登记的维修/故障记录(T01 故障在趋势运行后晚到登记) ----
+    db.add_all([
+        MaintenanceEvent(train_id=t02.id, component_install_id=i_t02a.id,
+                         type="REPAIR",
+                         occurred_at=datetime(2026, 10, 10, 9),
+                         recorded_at=datetime(2026, 10, 10, 10),
+                         description="牵引电机 TM-T02-A 寿命到期,更换为 TM-T02-B"),
+        MaintenanceEvent(train_id=t03.id, component_install_id=i_t03a.id,
+                         type="FAULT",
+                         occurred_at=datetime(2026, 10, 22, 10, 15),
+                         recorded_at=datetime(2026, 10, 22, 11, 0),
+                         description="牵引电机接地故障,列车救援回库"),
+        MaintenanceEvent(train_id=t03.id, component_install_id=i_t03a.id,
+                         type="REPAIR",
+                         occurred_at=datetime(2026, 10, 23, 14),
+                         recorded_at=datetime(2026, 10, 23, 15),
+                         description="更换牵引电机 TM-T03-B"),
+    ])
+
+    # ---- 历史运行 ----
+    def D(m, d, h=8):
+        return datetime(2026, m, d, h)
+
+    # T01: 8 月高温(季节负荷) + 9-10 月健康基线 + 11 月慢性劣化
+    t01_runs = [
+        ("RUN-2001", D(8, 3), 33, 1.28, False), ("RUN-2002", D(8, 10), 32, 1.28, False),
+        ("RUN-2003", D(8, 17), 34, 1.28, False), ("RUN-2004", D(8, 24), 33, 1.28, False),
+        ("RUN-2005", D(8, 27), 33, 1.28, False),  # 高温高能耗但落在高温层基线内
+        ("RUN-2006", D(9, 5), 20, 1.00, False), ("RUN-2007", D(9, 12), 21, 1.00, False),
+        ("RUN-2008", D(9, 19), 19, 1.00, False), ("RUN-2009", D(9, 26), 20, 1.00, False),
+        ("RUN-2010", D(10, 3), 18, 1.00, False), ("RUN-2011", D(10, 10), 19, 1.00, False),
+        ("RUN-2012", D(10, 17), 18, 1.00, False),
+        ("RUN-2013", D(10, 20, 12), 18, 1.04, True),   # 临时限速,条件调整后不超限
+        ("RUN-2014", D(10, 24), 19, 1.00, False),
+        ("RUN-2015", D(10, 27), 18, 1.04, True),
+        ("RUN-2016", D(11, 1), 17, 1.04, False),   # 劣化起步,尚在基线内
+        ("RUN-2017", D(11, 4), 17, 1.12, False),   # 以下持续超限 -> 慢性劣化
+        ("RUN-2018", D(11, 7), 16, 1.20, False),
+        ("RUN-2019", D(11, 10), 16, 1.28, False),
+        ("RUN-2020", D(11, 13), 15, 1.36, False),
+        ("RUN-2021", D(11, 16), 15, 1.45, False),
+    ]
+    for key, start, temp, factor, restr in t01_runs:
+        gen_health_run(db, st, key, t01, l1, s1, sub1, c01, ob1, start,
+                       temp, 800, factor, restriction=restr)
+
+    # T02: 9 月健康(旧电机) + 10-10 更换 + 新周期(校准过期/失效/条件缺失)
+    t02_runs = [
+        ("RUN-2022", D(9, 2, 9), 19, 1.00, c02a, True),
+        ("RUN-2023", D(9, 9, 9), 20, 1.00, c02a, True),
+        ("RUN-2024", D(9, 16, 9), 20, 1.00, c02a, True),
+        ("RUN-2025", D(9, 23, 9), 19, 1.00, c02a, True),
+        ("RUN-2026", D(9, 30, 9), 18, 1.00, c02a, True),
+        ("RUN-2027", D(10, 7, 9), 18, 1.00, c02a, True),
+        ("RUN-2028", D(10, 12, 9), 17, 1.00, c02b, True),   # 校准过期 -> 降级
+        ("RUN-2029", D(10, 19, 9), 18, 1.00, c02b, True),   # 校准过期 -> 降级
+        ("RUN-2030", D(10, 26, 9), 18, 1.00, c02b, True),
+        ("RUN-2031", D(11, 2, 9), 16, 1.30, c02b, True),    # 校准失效:高能耗取消资格
+        ("RUN-2032", D(11, 9, 9), 15, 1.00, c02b, False),   # 条件缺失 -> 取消资格
+        ("RUN-2033", D(11, 16, 9), 15, 1.00, c02b, True),
+    ]
+    for key, start, temp, factor, consist, with_cond in t02_runs:
+        gen_health_run(db, st, key, t02, l1, s1, sub1, consist, ob2, start,
+                       temp, 800, factor, with_condition=with_cond)
+
+    # T03: 健康基线 + 10-22 突发故障 + 更换后新周期(校准过期下持续偏高)
+    t03_runs = [
+        ("RUN-2034", D(9, 3, 10), 21, 1.00), ("RUN-2035", D(9, 10, 10), 20, 1.00),
+        ("RUN-2036", D(9, 17, 10), 19, 1.00), ("RUN-2037", D(9, 24, 10), 18, 1.00),
+        ("RUN-2038", D(10, 1, 10), 18, 1.00), ("RUN-2039", D(10, 8, 10), 17, 1.00),
+        ("RUN-2040", D(10, 15, 10), 17, 1.00),
+        ("RUN-2041", D(10, 22, 10), 16, 1.55),  # 突发剧增 -> 突发报警
+        ("RUN-2042", D(10, 30, 10), 14, 1.18),  # 校准过期:持续超限但报警降级
+        ("RUN-2043", D(11, 6, 10), 12, 1.18),
+        ("RUN-2044", D(11, 13, 10), 11, 1.18),
+    ]
+    for key, start, temp, factor in t03_runs:
+        gen_health_run(db, st, key, t03, l2, s3, sub3, c03, ob3, start,
+                       temp, 500, factor)
+    db.flush()
+
+    # ---- 趋势运行 第一批:截至 11-20(T01 故障尚未登记) ----
+    run_trend_batch(db, datetime(2026, 11, 20), "SEED")
+
+    # ---- 维修记录晚到:T01 故障 11-15 发生、11-25 才登记 ----
+    # 触发新一轮趋势运行:故障前 10 天窗口重标为 EXCLUDED_PRE_FAULT 并移出基线,
+    # 旧报警保留当时依据,维修回查可见该故障确认了既有报警。
+    record_maintenance(db, t01.id, "FAULT", datetime(2026, 11, 15, 20),
+                       "牵引电机轴承故障确认(维修中心补录,晚到 10 天)",
+                       component_install_id=i_t01.id,
+                       recorded_at=datetime(2026, 11, 25, 9))
 
 
 def seed():
@@ -288,8 +489,22 @@ def seed():
         # SUB-S3 在该窗口无任何读数(表计检修)-> 供电侧未知
         process(db, r6)
 
+        # ---- 既有运行的条件变量(健康分析输入;RUN-1005 取最新版本 v2) ----
+        db.add_all([
+            RunCondition(run_id=r1.id, ambient_temp_c=18, weather="CLEAR"),
+            RunCondition(run_id=r2.id, ambient_temp_c=18, weather="CLEAR"),
+            RunCondition(run_id=r3.id, ambient_temp_c=12, weather="CLEAR"),
+            RunCondition(run_id=r4.id, ambient_temp_c=19, weather="CLEAR"),
+            RunCondition(run_id=r5v2.id, ambient_temp_c=18, weather="CLEAR"),
+            RunCondition(run_id=r6.id, ambient_temp_c=11, weather="CLEAR"),
+        ])
+
+        # ============ 设备健康:档案 + 六类验收场景 ============
+        seed_health(db, st, t01, t02, t03, l1, l2, s1, s3, sub1, sub3,
+                    c01, c02a, c02b, c03, ob1, ob2, ob3)
+
         db.commit()
-        print("seed ok: 6 runs, 含五类验收场景")
+        print("seed ok: 6 个能耗场景 + 44 个健康场景运行,含两批趋势运行")
     finally:
         db.close()
 

@@ -9,6 +9,9 @@
         <el-menu-item index="/runs">运行与能量</el-menu-item>
         <el-menu-item index="/metrics">指标服务</el-menu-item>
         <el-menu-item index="/replay">复盘回查</el-menu-item>
+        <el-menu-item index="/health">健康档案</el-menu-item>
+        <el-menu-item index="/health/trends">残差趋势</el-menu-item>
+        <el-menu-item index="/health/alerts">健康报警</el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>

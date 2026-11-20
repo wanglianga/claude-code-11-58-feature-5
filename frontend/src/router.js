@@ -12,6 +12,9 @@ const routes = [
       { path: 'runs/:id', component: () => import('./views/RunDetail.vue') },
       { path: 'metrics', component: () => import('./views/Metrics.vue') },
       { path: 'replay', component: () => import('./views/Replay.vue') },
+      { path: 'health', component: () => import('./views/HealthProfile.vue') },
+      { path: 'health/trends', component: () => import('./views/HealthTrends.vue') },
+      { path: 'health/alerts', component: () => import('./views/HealthAlerts.vue') },
     ],
   },
 ]
